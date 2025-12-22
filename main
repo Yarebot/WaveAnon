@@ -1,0 +1,169 @@
+import telebot
+from telebot import types
+
+# 1. КОНФИГУРАЦИЯ
+API_TOKEN = '8468897119:AAGJOiVe9JmgT34LGxogkqs3xFEewJUSzmU'
+
+bot = telebot.TeleBot(API_TOKEN)
+
+# user_states: Кто кому задает вопросы {id_отправителя: id_получателя}
+user_states = {}
+
+# reply_map: Запоминаем ID сообщений, чтобы работал СВАЙП
+# Формат: { "IDчата_IDсообщения": ID_реального_отправителя }
+reply_map = {}
+
+# 2. ОБРАБОТКА КОМАНДЫ /START
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user_id = message.chat.id
+    text_parts = message.text.split()
+
+    # СЦЕНАРИЙ А: Переход по ссылке (хочет написать вопрос)
+    if len(text_parts) > 1:
+        recipient_id = text_parts[1]
+
+        if str(recipient_id) == str(user_id):
+            bot.send_message(user_id, "❌ Вы не можете писать самому себе.")
+            return
+
+        user_states[user_id] = int(recipient_id)
+
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        markup.add(types.KeyboardButton("❌ Отмена"))
+
+        bot.send_message(
+            user_id,
+            "🚀 Напишите сообщение или отправьте фото:",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+
+    # СЦЕНАРИЙ Б: Просто запустил бота (хочет свою ссылку)
+    else:
+        if user_id in user_states: del user_states[user_id]
+        
+        bot_username = bot.get_me().username
+        link = f"https://t.me/{bot_username}?start={user_id}"
+        
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        btn_share = types.InlineKeyboardButton("🔗 Поделиться ссылкой", url=f"https://t.me/share/url?url={link}&text=Задай мне анонимный вопрос!")
+        btn_add = types.InlineKeyboardButton("👥 Добавить бота в чат", url=f"https://t.me/{bot_username}?startgroup=true")
+        markup.add(btn_share, btn_add)
+
+        bot.send_message(
+            user_id,
+            f"Начните получать анонимные вопросы прямо сейчас!\n\n👉 {link}\n\nРазместите эту ссылку в описании профиля.",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+
+# 3. ОБРАБОТКА СООБЩЕНИЙ (ТЕКСТ И ФОТО)
+@bot.message_handler(content_types=['text', 'photo'])
+def handle_message(message):
+    user_id = message.chat.id
+    
+    # --- ПРОВЕРКА НА ОТМЕНУ ---
+    if message.content_type == 'text' and message.text == "❌ Отмена":
+        if user_id in user_states: del user_states[user_id]
+        bot.send_message(user_id, "Действие отменено.", reply_markup=types.ReplyKeyboardRemove())
+        send_welcome(message)
+        return
+
+    # --- ЛОГИКА 1: ЭТО ОТВЕТ (СВАЙП) ---
+    # Если пользователь ответил на сообщение (свайпнул его)
+    if message.reply_to_message:
+        # Создаем уникальный ключ сообщения, на которое ответили
+        reply_key = f"{user_id}_{message.reply_to_message.message_id}"
+        
+        if reply_key in reply_map:
+            original_sender_id = reply_map[reply_key]
+            
+            try:
+                # Формируем ответ
+                answer_text = message.text if message.content_type == 'text' else message.caption or "Фото"
+                
+                if message.content_type == 'photo':
+                    bot.send_photo(original_sender_id, message.photo[-1].file_id, caption=f"💬 <b>Вам пришел ответ:</b>\n\n{answer_text}", parse_mode="HTML")
+                else:
+                    bot.send_message(original_sender_id, f"💬 <b>Вам пришел ответ:</b>\n\n{message.text}", parse_mode="HTML")
+                
+                bot.send_message(user_id, "✅ Ответ отправлен анониму!")
+            except Exception:
+                bot.send_message(user_id, "❌ Не удалось отправить ответ (возможно, пользователь заблокировал бота).")
+        else:
+            bot.send_message(user_id, "⚠️ Это сообщение слишком старое, я не помню отправителя.")
+        return
+
+# --- ЛОГИКА 2: ОТПРАВКА НОВОГО ВОПРОСА ---
+    if user_id in user_states:
+        recipient_id = user_states[user_id]
+        
+        try:
+            # Текст сообщения
+            msg_text = message.text if message.content_type == 'text' else message.caption or ""
+            # Если текста нет (просто фото без подписи), ставим пробел, чтобы не было ошибки
+            if not msg_text and message.content_type == 'photo': msg_text = " "
+
+            # ФОРМИРУЕМ ВИД КАК НА СКРИНШОТЕ (HTML)
+            # <blockquote> делает ту самую полоску
+            formatted_text = (
+                "💘 <b>У тебя новое сообщение!</b>\n\n"
+                f"<blockquote>{msg_text}</blockquote>\n"
+                "↩️ Свайпни для ответа."
+            )
+
+            sent_msg = None
+            if message.content_type == 'photo':
+                sent_msg = bot.send_photo(recipient_id, message.photo[-1].file_id, caption=formatted_text, parse_mode="HTML")
+            else:
+                sent_msg = bot.send_message(recipient_id, formatted_text, parse_mode="HTML")
+            
+            # ЗАПОМИНАЕМ ID СООБЩЕНИЯ ДЛЯ СВАЙПА
+            # Ключ = IDполучателя_IDсообщения
+            reply_map[f"{recipient_id}_{sent_msg.message_id}"] = user_id
+
+            # Кнопка удаления для отправителя (меню управления)
+            delete_data = f"delete_{recipient_id}_{sent_msg.message_id}"
+            markup_sender = types.InlineKeyboardMarkup()
+            markup_sender.add(
+                types.InlineKeyboardButton("Написать ещё ✍️", callback_data='write_more'),
+                types.InlineKeyboardButton("Удалить сообщение 🗑", callback_data=delete_data)
+            )
+
+            bot.send_message(user_id, "Сообщение отправлено!", reply_markup=markup_sender)
+        
+        except Exception as e:
+            bot.send_message(user_id, "❌ Ошибка отправки (возможно, бот заблокирован).")
+            print(e)
+            
+    else:
+        bot.send_message(user_id, "Нажмите /start, чтобы получить ссылку.")
+
+# 4. ОБРАБОТКА КНОПОК УДАЛЕНИЯ (У ОТПРАВИТЕЛЯ)
+@bot.callback_query_handler(func=lambda call: True)
+def callback_inline(call):
+    try:
+        if call.data.startswith('delete_'):
+            parts = call.data.split('_')
+            recipient_id, msg_id = parts[1], parts[2]
+            
+            # Удаляем у получателя
+            try: bot.delete_message(recipient_id, msg_id)
+            except: pass
+            # Удаляем у отправителя
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except: pass
+            
+            bot.answer_callback_query(call.id, "Удалено!")
+
+        elif call.data == 'write_more':
+            bot.answer_callback_query(call.id, "Пишите...")
+            try: bot.delete_message(call.message.chat.id, call.message.message_id)
+            except: pass
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+print("Бот запущен...")
+bot.infinity_polling(skip_pending=True)
